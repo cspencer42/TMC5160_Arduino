@@ -3,6 +3,7 @@ MIT License
 
 Copyright (c) 2016 Mike Estee
 Copyright (c) 2017 Tom Magnier
+Copyright (c) 2023 Photocentric (added endstop, load measurement, microstep and diag pin control)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -135,6 +136,13 @@ void TMC5160::setRampMode(TMC5160::RampMode mode)
 	_currentRampMode = mode;
 }
 
+void TMC5160::setMicrosteps(Microsteps resolution) {
+	TMC5160_Reg::CHOPCONF_Register chopconf={0};
+	chopconf.value=readRegister(TMC5160_Reg::CHOPCONF);
+	chopconf.mres=resolution;
+	writeRegister(TMC5160_Reg::CHOPCONF,chopconf.value);
+}
+
 float TMC5160::getCurrentPosition()
 {
 	int32_t uStepPos = readRegister(TMC5160_Reg::XACTUAL);
@@ -198,6 +206,7 @@ float TMC5160::getCurrentSpeed()
 
 	return speedToHz(data);
 }
+
 
 void TMC5160::setCurrentPosition(float position, bool updateEncoderPos)
 {
@@ -456,4 +465,69 @@ void TMC5160::setShortProtectionLevels(int s2vsLevel, int s2gLevel, int shortFil
 	shortConf.shortdelay = constrain(shortDelay, 0, 1);
 
 	writeRegister(TMC5160_Reg::SHORT_CONF, shortConf.value);
+}
+
+void TMC5160::setCoolStep() {
+
+}
+
+void TMC5160::setEndstopLeft(bool enable,bool inverted, bool latch_active, bool latch_inactive) {
+	TMC5160_Reg::SW_MODE_Register sw_mode={0};
+	sw_mode.value=readRegister(TMC5160_Reg::SW_MODE);
+	sw_mode.stop_l_enable=enable;
+	sw_mode.pol_stop_l=inverted;
+	sw_mode.latch_l_active=latch_active;
+	sw_mode.latch_l_inactive=latch_inactive;
+	writeRegister(TMC5160_Reg::SW_MODE,sw_mode.value);
+}
+void TMC5160::setEndstopRight(bool enable,bool inverted, bool latch_active, bool latch_inactive) {
+	TMC5160_Reg::SW_MODE_Register sw_mode={0};
+	sw_mode.value=readRegister(TMC5160_Reg::SW_MODE);
+	sw_mode.stop_r_enable=enable;
+	sw_mode.pol_stop_r=inverted;
+	sw_mode.latch_r_active=latch_active;
+	sw_mode.latch_r_inactive=latch_inactive;
+	writeRegister(TMC5160_Reg::SW_MODE,sw_mode.value);
+}
+void TMC5160::setStallGuard(int sensitivity, bool filtering, bool stop) {
+	TMC5160_Reg::COOLCONF_Register coolconf={0};
+	coolconf.value = readRegister(TMC5160_Reg::COOLCONF);
+	coolconf.sgt=constrain(sensitivity,-63,63);
+	coolconf.sfilt=filtering;
+	writeRegister(TMC5160_Reg::COOLCONF,coolconf.value);
+	TMC5160_Reg::SW_MODE_Register sw_mode={0};
+	sw_mode.value=readRegister(TMC5160_Reg::SW_MODE);
+	sw_mode.sg_stop=stop;
+	writeRegister(TMC5160_Reg::SW_MODE,sw_mode.value);
+}
+bool TMC5160::isStalled() {
+	TMC5160_Reg::DRV_STATUS_Register drvStatus = {0};
+	drvStatus.value = readRegister(TMC5160_Reg::DRV_STATUS);
+	return (bool)drvStatus.stallguard;
+}
+
+void TMC5160::setDiagModes(Diag0Conf diag0, Diag1Conf diag1) {
+	TMC5160_Reg::GCONF_Register gconf={0};
+	gconf.value = readRegister(TMC5160_Reg::GCONF);
+	gconf.diag0_error=diag0.error;
+	gconf.diag0_otpw=diag0.overtemp;
+	gconf.diag0_stall_step=diag0.mode;
+	gconf.diag0_int_pushpull=diag0.output;
+
+	gconf.diag1_index=false;
+	gconf.diag1_onstate=false;
+	gconf.diag1_stall_dir=diag1.mode;
+	gconf.diag1_poscomp_pushpull=diag1.output;
+
+	writeRegister(TMC5160_Reg::GCONF,gconf.value);
+}
+
+int TMC5160::getLoad() {
+	TMC5160_Reg::DRV_STATUS_Register drvStatus = {0};
+	drvStatus.value = readRegister(TMC5160_Reg::DRV_STATUS);
+	if (getCurrentSpeed()!=0) {
+		return drvStatus.sg_result;
+	} else {
+		return -1;
+	}
 }

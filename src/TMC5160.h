@@ -3,6 +3,7 @@ MIT License
 
 Copyright (c) 2016 Mike Estee (Estee_TMC5160)
 Copyright (c) 2017 Tom Magnier
+Copyright (c) 2023 Photocentric (added endstop, load measurement, microstep and diag pin control)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -30,6 +31,7 @@ SOFTWARE.
 #include <SPI.h>
 #include <TMC5160_registers.h>
 
+
 class TMC5160 {
 public:
 	static constexpr uint8_t IC_VERSION = 0x30;
@@ -37,6 +39,33 @@ public:
 
 	enum MotorDirection { NORMAL_MOTOR_DIRECTION =	0x00, INVERSE_MOTOR_DIRECTION = 0x1 };
 	enum RampMode { POSITIONING_MODE, VELOCITY_MODE, HOLD_MODE };
+
+	enum Microsteps {
+		MICROSTEP_256,
+		MICROSTEP_128,
+		MICROSTEP_64,
+		MICROSTEP_32,
+		MICROSTEP_16,
+		MICROSTEP_8,
+		MICROSTEP_4,
+		MICROSTEP_2,
+		FULLSTEP
+	};
+
+	enum Diag0Mode{STEP=1,INTERRUPT=0};
+	enum Diag1Mode{DIR=1,POSITION_REACHED=0};
+	enum DiagOutput{ACTIVE_HIGH=1,ACTIVE_LOW=0};
+	// The following modes assume it is an spi motion controller (SD_MODE=0)
+	struct Diag0Conf {
+		bool error=true; // driver error
+		bool overtemp=true; // overtemperature event
+		Diag0Mode mode=INTERRUPT; // step output
+		DiagOutput output=ACTIVE_HIGH; // output is active high pushpull, otherwise is active low sink
+	};
+	struct Diag1Conf {
+		Diag1Mode mode =POSITION_REACHED; // dir output, otherwise whether target position reached
+		DiagOutput output=ACTIVE_HIGH; // output is active high pushpull, otherwise is active low sink
+	};
 
 	enum DriverStatus { 
 		OK, // No error condition
@@ -48,6 +77,12 @@ public:
 		OT, // Overtemperature (error)
 		OTHER_ERR, // GSTAT drv_err is set but none of the above conditions is found.
 		OTPW // Overtemperature pre warning
+	};
+
+	struct EndstopStatus {
+		bool active;
+		bool latch;
+		bool stop;
 	};
 
 	struct PowerStageParameters {
@@ -98,13 +133,16 @@ public:
 	*/
 	void setRampMode(RampMode mode);
 
+	void setMicrosteps(Microsteps resolution=MICROSTEP_256);
+
 	float getCurrentPosition(); // Return the current internal position (steps)
 	float getEncoderPosition(); // Return the current position according to the encoder counter (steps)
 	float getLatchedPosition(); // Return the position that was latched on the last ref switch / encoder event (steps)
 	float getLatchedEncoderPosition(); // Return the encoder position that was latched on the last encoder event (steps)
 	float getTargetPosition(); // Get the target position (steps)
 	float getCurrentSpeed(); // Return the current speed (steps / second)
-
+	
+	void setDiagModes(Diag0Conf diag0, Diag1Conf diag1);
 
 	void setCurrentPosition(float position, bool updateEncoderPos = false); // Set the current internal position (steps) and optionally update the encoder counter as well to keep them in sync.
 	void setTargetPosition(float position); // Set the target position /!\ Set all other motion profile parameters before
@@ -179,7 +217,19 @@ public:
 	/* Clear encoder deviation flag (deviation condition must be handled before) */
 	void clearEncoderDeviationFlag();
 
-	//TODO end stops and stallguard config functions ?
+	void setCoolStep();
+
+	void setEndstopLeft(bool enable,bool inverted=false, bool latch_active=false, bool latch_inactive=false);
+	void setEndstopRight(bool enable,bool inverted=false, bool latch_active=false, bool latch_inactive=false);
+	EndstopStatus getEndstopLeft();
+	EndstopStatus getEndstopRight();
+	/* Configure the stallguard. 
+	 * sensitivity (sgt) range -63 to 63, where -63 is highest sensitivity. For stall detection should be 0 upon stall.
+	 * filtering (sfilt) enables filtering for smoother load readings, unsuitable for sensorless homing as this reduces response time
+	 * stop (sg_stop) causes the motor to stop automatically when a stall is detected */
+	void setStallGuard(int sensitivity, bool filtering=false, bool stop=false);
+	bool isStalled(); // check the stall flag
+	int getLoad(); // Return stallguard value, 0-1023 where 0 is maximum. Affected by SGT (stallguard sensitivity). Returns -1 when at a standstill
 
 	/* Configure the integrated short protection. Check datasheet for details.
 	 * - s2vsLevel : 4 (highest sensitivity) to 15 ; 6 to 8 recommended ; reset default 6
@@ -238,173 +288,175 @@ private:
 };
 
 
-/* Generic UART interface */
-class TMC5160_UART_Generic : public TMC5160 {
-public:
-	/* Read/write register return codes */
-	enum ReadStatus {SUCCESS, NO_REPLY, INVALID_FORMAT, BAD_CRC};
 
-	/* Serial communication modes. In reliable mode, register writes are checked and
-	 * retried if necessary, and register reads are retried multiple times in case
-	 * of failure. In streaming mode, none of these checks are performed and register
-	 * read / writes are tried only once. Default is Streaming mode. */
-	enum CommunicationMode {RELIABLE_MODE, STREAMING_MODE};
+// /* Generic UART interface */
+// class TMC5160_UART_Generic : public TMC5160 {
+// public:
+// 	/* Read/write register return codes */
+// 	enum ReadStatus {SUCCESS, NO_REPLY, INVALID_FORMAT, BAD_CRC};
 
-
-	TMC5160_UART_Generic(uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
-		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
-		uint32_t fclk = DEFAULT_F_CLK); // TMC5160 clock freq 
-
-	virtual bool begin(PowerStageParameters &powerParams, MotorParameters &motorParams, MotorDirection stepperDirection/*=NORMAL_MOTOR_DIRECTION*/);
-
-	uint32_t readRegister(uint8_t address, ReadStatus *status);	// addresses are from TMC5160.h. Pass an optional status pointer to detect failures.
-	uint32_t readRegister(uint8_t address) { return readRegister(address, nullptr); }
-	uint8_t  writeRegister(uint8_t address, uint32_t data, ReadStatus *status); // Pass an optional status pointer to detect failures.
-	uint8_t writeRegister(uint8_t address, uint32_t data) { return writeRegister(address, data, nullptr); }
-
-	void resetCommunication(); // Reset communication with TMC5160 : pause activity on the serial bus.
-
-	void setSlaveAddress(uint8_t slaveAddress, bool NAI=true); // Set the slave address register. Take into account the TMC5160 NAI input (default to high). Range : 0 - 253 if NAI is low, 1 - 254 if NAI is high.
-	void setInternalSlaveAddress(uint8_t slaveAddress) { _slaveAddress = slaveAddress; }
-	uint8_t getSlaveAddress() { return _slaveAddress; }
-
-	void setCommunicationMode(CommunicationMode mode);
-
-	/* Register read / write statistics */
-	void resetCommunicationSuccessRate();
-	float getReadSuccessRate();
-	float getWriteSuccessRate();
-protected:
-	static constexpr uint8_t NB_RETRIES_READ = 3;
-	static constexpr uint8_t NB_RETRIES_WRITE = 3;
-
-	uint8_t _slaveAddress;
-	CommunicationMode _currentMode;
-	uint8_t _transmissionCounter;
-	uint32_t _uartBaudRate;
-
-	/* Read / write fail statistics */
-	uint32_t _readAttemptsCounter = 0;
-	uint32_t _readSuccessfulCounter = 0;
-	uint32_t _writeAttemptsCounter = 0;
-	uint32_t _writeSuccessfulCounter = 0;
+// 	/* Serial communication modes. In reliable mode, register writes are checked and
+// 	 * retried if necessary, and register reads are retried multiple times in case
+// 	 * of failure. In streaming mode, none of these checks are performed and register
+// 	 * read / writes are tried only once. Default is Streaming mode. */
+// 	enum CommunicationMode {RELIABLE_MODE, STREAMING_MODE};
 
 
-	virtual void beginTransmission() {}
-	virtual void endTransmission() {}
+// 	TMC5160_UART_Generic(uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
+// 		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
+// 		uint32_t fclk = DEFAULT_F_CLK); // TMC5160 clock freq 
 
-	virtual void uartFlushInput() = 0;
-	virtual void uartWriteBytes(const uint8_t *buf, uint8_t len) = 0;
-	virtual int uartReadBytes(uint8_t *buf, uint8_t len) = 0;
-	virtual uint8_t uartReadByte() = 0;
-	virtual int uartBytesAvailable() = 0;
+// 	virtual bool begin(PowerStageParameters &powerParams, MotorParameters &motorParams, MotorDirection stepperDirection/*=NORMAL_MOTOR_DIRECTION*/);
 
-	uint32_t _readReg(uint8_t address, ReadStatus *status);
-	void _writeReg(uint8_t address, uint32_t data);
+// 	uint32_t readRegister(uint8_t address, ReadStatus *status);	// addresses are from TMC5160.h. Pass an optional status pointer to detect failures.
+// 	uint32_t readRegister(uint8_t address) { return readRegister(address, nullptr); }
+// 	uint8_t  writeRegister(uint8_t address, uint32_t data, ReadStatus *status); // Pass an optional status pointer to detect failures.
+// 	uint8_t writeRegister(uint8_t address, uint32_t data) { return writeRegister(address, data, nullptr); }
 
-	void delayBitTimes(uint16_t bits);
+// 	void resetCommunication(); // Reset communication with TMC5160 : pause activity on the serial bus.
 
-private:
-	static constexpr uint8_t SYNC_BYTE = 0x05;
-	static constexpr uint8_t MASTER_ADDRESS = 0xFF;
+// 	void setSlaveAddress(uint8_t slaveAddress, bool NAI=true); // Set the slave address register. Take into account the TMC5160 NAI input (default to high). Range : 0 - 253 if NAI is low, 1 - 254 if NAI is high.
+// 	void setInternalSlaveAddress(uint8_t slaveAddress) { _slaveAddress = slaveAddress; }
+// 	uint8_t getSlaveAddress() { return _slaveAddress; }
 
-	void computeCrc(uint8_t *datagram, uint8_t datagramLength);
-};
+// 	void setCommunicationMode(CommunicationMode mode);
+
+// 	/* Register read / write statistics */
+// 	void resetCommunicationSuccessRate();
+// 	float getReadSuccessRate();
+// 	float getWriteSuccessRate();
+// protected:
+// 	static constexpr uint8_t NB_RETRIES_READ = 3;
+// 	static constexpr uint8_t NB_RETRIES_WRITE = 3;
+
+// 	uint8_t _slaveAddress;
+// 	CommunicationMode _currentMode;
+// 	uint8_t _transmissionCounter;
+// 	uint32_t _uartBaudRate;
+
+// 	/* Read / write fail statistics */
+// 	uint32_t _readAttemptsCounter = 0;
+// 	uint32_t _readSuccessfulCounter = 0;
+// 	uint32_t _writeAttemptsCounter = 0;
+// 	uint32_t _writeSuccessfulCounter = 0;
 
 
-/* Arduino UART interface :
- * the TMC5160 SD_MODE and SPI_MODE inputs must be tied low.
- *
- * This class does not handle TX/RX switch on the half-duplex bus.
- * It should be used only if there is another mechanism to switch between
- * transmission and reception (e.g. on Teensy the Serial class can be configured
- * to control an external transceiver). 
- * 
- * It is not advised to use this class directly. Use TMC5160_UART_Transceiver instead
- * as it provides a better control of the transceiver enable. The TMC5160 sometimes
- * requires the bus to be in an stable state for a given duration (bus reset time) 
- * before accepting commands.
- *
- * Serial must be initialized externally. Serial.setTimeout() must be set to a
- * decent value to avoid blocking for too long if there is a RX error.
- */
-class TMC5160_UART : public TMC5160_UART_Generic {
-public:
-	TMC5160_UART(Stream& serial = Serial, // Serial port to use
-		uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
-		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
-		uint32_t fclk = DEFAULT_F_CLK) : // TMC5160 clock freq 
-		TMC5160_UART_Generic(slaveAddress, baudRate, fclk), _serial(&serial)
-	{	}
+// 	virtual void beginTransmission() {}
+// 	virtual void endTransmission() {}
 
-protected:
-	Stream *_serial;
+// 	virtual void uartFlushInput() = 0;
+// 	virtual void uartWriteBytes(const uint8_t *buf, uint8_t len) = 0;
+// 	virtual int uartReadBytes(uint8_t *buf, uint8_t len) = 0;
+// 	virtual uint8_t uartReadByte() = 0;
+// 	virtual int uartBytesAvailable() = 0;
 
-	virtual void uartFlushInput()
-	{
-		while (_serial->available())
-			_serial->read();
-	}
+// 	uint32_t _readReg(uint8_t address, ReadStatus *status);
+// 	void _writeReg(uint8_t address, uint32_t data);
 
-	virtual void uartWriteBytes(const uint8_t *buf, uint8_t len)
-	{
-		_serial->write(buf, len);
-	}
+// 	void delayBitTimes(uint16_t bits);
 
-	virtual int uartReadBytes(uint8_t *buf, uint8_t len)
-	{
-		return _serial->readBytes(buf, len);
-	}
+// private:
+// 	static constexpr uint8_t SYNC_BYTE = 0x05;
+// 	static constexpr uint8_t MASTER_ADDRESS = 0xFF;
 
-	virtual uint8_t uartReadByte()
-	{
-		return (uint8_t)(_serial->read());
-	}
+// 	void computeCrc(uint8_t *datagram, uint8_t datagramLength);
+// };
 
-	virtual int uartBytesAvailable()
-	{
-		return _serial->available();
-	}
-};
 
-/* Arduino UART interface with external transceiver support :
- * the TMC5160 SD_MODE and SPI_MODE inputs must be tied low.
- * See TMC5160 datasheet §5.4 figure 5.2 for wiring details
- *
- * This interface switches a digital pin to control an external transceiver to
- * free the bus when not transmitting.
- *
- * Serial must be initialized externally. Serial.setTimeout() must be set to a
- * decent value to avoid blocking for too long if there is a RX error.
- */
-class TMC5160_UART_Transceiver : public TMC5160_UART {
-public:
-	TMC5160_UART_Transceiver(uint8_t txEnablePin = -1, // pin to enable transmission on the external transceiver
-		Stream& serial = Serial, // Serial port to use
-		uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
-		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
-		uint32_t fclk = DEFAULT_F_CLK) // TMC5160 clock freq 
-	: TMC5160_UART(serial, slaveAddress, baudRate, fclk), _txEn(txEnablePin)
-	{
-		pinMode(_txEn, OUTPUT);
-	}
+// /* Arduino UART interface :
+//  * the TMC5160 SD_MODE and SPI_MODE inputs must be tied low.
+//  *
+//  * This class does not handle TX/RX switch on the half-duplex bus.
+//  * It should be used only if there is another mechanism to switch between
+//  * transmission and reception (e.g. on Teensy the Serial class can be configured
+//  * to control an external transceiver). 
+//  * 
+//  * It is not advised to use this class directly. Use TMC5160_UART_Transceiver instead
+//  * as it provides a better control of the transceiver enable. The TMC5160 sometimes
+//  * requires the bus to be in an stable state for a given duration (bus reset time) 
+//  * before accepting commands.
+//  *
+//  * Serial must be initialized externally. Serial.setTimeout() must be set to a
+//  * decent value to avoid blocking for too long if there is a RX error.
+//  */
+// class TMC5160_UART : public TMC5160_UART_Generic {
+// public:
+// 	TMC5160_UART(Stream& serial = Serial, // Serial port to use
+// 		uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
+// 		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
+// 		uint32_t fclk = DEFAULT_F_CLK) : // TMC5160 clock freq 
+// 		TMC5160_UART_Generic(slaveAddress, baudRate, fclk), _serial(&serial)
+// 	{	}
 
-protected:
-	void beginTransmission()
-	{
-		digitalWrite(_txEn, HIGH);
-		delayBitTimes(63+12+4); // Some ICs are more sensitive and need a communication reset time between 2 read/write accesses.
-	}
+// protected:
+// 	Stream *_serial;
 
-	void endTransmission()
-	{
-		_serial->flush();
-		digitalWrite(_txEn, LOW);
-	}
+// 	virtual void uartFlushInput()
+// 	{
+// 		while (_serial->available())
+// 			_serial->read();
+// 	}
 
-private:
-	uint8_t _txEn;
-};
+// 	virtual void uartWriteBytes(const uint8_t *buf, uint8_t len)
+// 	{
+// 		_serial->write(buf, len);
+// 	}
+
+// 	virtual int uartReadBytes(uint8_t *buf, uint8_t len)
+// 	{
+// 		return _serial->readBytes(buf, len);
+// 	}
+
+// 	virtual uint8_t uartReadByte()
+// 	{
+// 		return (uint8_t)(_serial->read());
+// 	}
+
+// 	virtual int uartBytesAvailable()
+// 	{
+// 		return _serial->available();
+// 	}
+// };
+
+// /* Arduino UART interface with external transceiver support :
+//  * the TMC5160 SD_MODE and SPI_MODE inputs must be tied low.
+//  * See TMC5160 datasheet §5.4 figure 5.2 for wiring details
+//  *
+//  * This interface switches a digital pin to control an external transceiver to
+//  * free the bus when not transmitting.
+//  *
+//  * Serial must be initialized externally. Serial.setTimeout() must be set to a
+//  * decent value to avoid blocking for too long if there is a RX error.
+//  */
+// class TMC5160_UART_Transceiver : public TMC5160_UART {
+// public:
+// 	TMC5160_UART_Transceiver(uint8_t txEnablePin = -1, // pin to enable transmission on the external transceiver
+// 		Stream& serial = Serial, // Serial port to use
+// 		uint8_t slaveAddress = 0, // TMC5160 slave address (default 0 if NAI is low, 1 if NAI is high)
+// 		uint32_t baudRate = 500000, // UART baud rate (necessary to compute certain delays)
+// 		uint32_t fclk = DEFAULT_F_CLK) // TMC5160 clock freq 
+// 	: TMC5160_UART(serial, slaveAddress, baudRate, fclk), _txEn(txEnablePin)
+// 	{
+// 		pinMode(_txEn, OUTPUT);
+// 	}
+
+// protected:
+// 	void beginTransmission()
+// 	{
+// 		digitalWrite(_txEn, HIGH);
+// 		delayBitTimes(63+12+4); // Some ICs are more sensitive and need a communication reset time between 2 read/write accesses.
+// 	}
+
+// 	void endTransmission()
+// 	{
+// 		_serial->flush();
+// 		digitalWrite(_txEn, LOW);
+// 	}
+
+// private:
+// 	uint8_t _txEn;
+// };
+
 
 
 #endif // TMC5160_H
